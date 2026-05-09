@@ -44,31 +44,68 @@ curl https://mcp.baisoln.com/gpu-ai/v1/video/lipsync/jobs/$JOB_ID
 curl -o result.mp4 https://mcp.baisoln.com/gpu-ai/v1/video/lipsync/jobs/$JOB_ID/result
 ```
 
-## Running locally
+## Deploying on Brev (one command)
+
+The repo includes `.brev/setup.sh` which Brev runs automatically on instance creation.
+
+```bash
+# Create instance (L40S recommended — 48 GB VRAM, matches tested config)
+brev create latentsync --gpu-name L40S
+
+# Set your Docker Hub PAT so the hook can pull the private base image
+brev secret set DOCKER_PAT <your-docker4zerocool-pat>
+```
+
+Brev will:
+1. Provision the GPU instance
+2. Run `.brev/setup.sh` automatically
+3. Download models (~4.9 GB from HuggingFace), build the image, start the container
+
+Once healthy (`/healthz → {"status":"ok"}`), port-forward to test locally:
+
+```bash
+brev port-forward latentsync -p 8014:8014
+curl http://localhost:8014/healthz
+```
+
+To expose it publicly, open the port:
+```bash
+brev exec latentsync "sudo ufw allow 8014/tcp"
+# Then hit http://<brev-public-ip>:8014/v1/video/lipsync
+```
+
+## Running on any GPU host
 
 ### Prerequisites
 
 - NVIDIA GPU with CUDA 12.x
-- Docker + NVIDIA Container Toolkit
-- LatentSync checkpoints downloaded to `/mnt/ai-models/models/latentsync/`
+- Docker 29+ with NVIDIA Container Toolkit
+- Docker Hub credentials for `docker4zerocool` (private base image)
 
-### Download models
+### One-shot setup
 
 ```bash
-bash server/download_models.sh
+git clone https://github.com/Bionic-AI-Solutions/LatentSync-API.git
+cd LatentSync-API
+DOCKER_PAT=<your-pat> bash setup.sh
 ```
 
-### Build and start
+`setup.sh` handles everything: Docker login, model download, image build, container start, UFW rule, and health check. It is idempotent — safe to re-run.
+
+### Manual steps
 
 ```bash
-# Build from repo root
+# 1. Download models
+bash server/download_models.sh
+
+# 2. Build image (from repo root)
 docker build -t docker4zerocool/ai-latentsync:latest -f server/Dockerfile .
 
-# Or use compose (from server/ dir)
-docker compose -f server/docker-compose.yaml up -d
+# 3. Start
+BASE_URL=http://<your-ip>:8014 docker compose -f server/docker-compose.yaml up -d
 ```
 
-Service listens on **port 8014**.
+Service listens on **port 8014**. `MODEL_DIR` and `BASE_URL` are overridable env vars.
 
 ## Architecture
 
