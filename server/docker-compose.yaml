@@ -1,0 +1,65 @@
+# LatentSync inference API — GPU service.
+#
+# Port 8014: next free after wav2lip (8011), IndexTTS2 (8012), musetalk (8013).
+#
+# Model layout on host (/mnt/ai-models/models/latentsync/):
+#   latentsync_unet.pt        main UNet checkpoint (~1.8 GB)
+#   whisper/tiny.pt           Whisper tiny audio encoder (~39 MB)
+#   insightface/              InsightFace face-detection weights
+#                             (auto-downloaded by insightface lib on first run,
+#                              then cached here for subsequent starts)
+#
+# HF cache (/mnt/ai-models/models/hf_cache/):
+#   models--stabilityai--sd-vae-ft-mse  already present — reused by this container
+#
+# Run:  docker compose -f server/docker-compose.yaml up -d
+# Logs: docker compose -f server/docker-compose.yaml logs -f
+
+services:
+  latentsync:
+    build:
+      context: ..
+      dockerfile: server/Dockerfile
+    image: docker4zerocool/ai-latentsync:latest
+    container_name: ai-latentsync
+    restart: unless-stopped
+    ports:
+      - "8014:8014"
+    environment:
+      # Checkpoint paths inside the container (volume-mapped from /mnt/ai-models)
+      LATENTSYNC_CKPT_PATH:    /models/latentsync_unet.pt
+      LATENTSYNC_WHISPER_PATH: /models/whisper/tiny.pt
+      LATENTSYNC_CONFIG:       /app/latentsync/configs/unet/stage2_512.yaml
+
+      # Inference defaults (overridable per-request via query params)
+      LATENTSYNC_STEPS:    "20"
+      LATENTSYNC_GUIDANCE: "1.5"
+
+      # Job result TTL before temp files are cleaned up (seconds)
+      JOB_TTL_SECONDS: "3600"
+
+      # Base URL used to build poll_url / video_url in responses
+      BASE_URL: "https://mcp.baisoln.com/gpu-ai"
+
+      # Point HuggingFace hub at the shared cache so sd-vae-ft-mse is found
+      # without re-downloading. Mount below is rw so HF can write lock files.
+      HF_HOME: /mnt/hf_cache
+
+      LOG_LEVEL: "info"
+
+    volumes:
+      # LatentSync checkpoints — read-only; populated by server/download_models.sh
+      - /mnt/ai-models/models/latentsync:/models:ro
+
+      # InsightFace face-detection weights — rw so first-run auto-download persists
+      - /mnt/ai-models/models/latentsync/insightface:/root/.insightface
+
+      # Shared HF cache — rw for lock files; sd-vae-ft-mse already present here
+      - /mnt/ai-models/models/hf_cache:/mnt/hf_cache
+
+      # Host CA bundle for outbound TLS (HF downloads, etc.)
+      - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
+
+    runtime: nvidia
+    devices:
+      - nvidia.com/gpu=all

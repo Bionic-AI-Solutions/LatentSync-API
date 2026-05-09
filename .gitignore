@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+*.egg
+
+# Virtual envs / conda
+.venv/
+env/
+venv/
+
+# Model checkpoints & weights — mount at runtime, do not commit
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+hf_cache/
+.insightface/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temp / job outputs
+*.mp4
+*.wav
+*.png
+*.jpg
+
+# Secrets / env
+.env
+.env.*
