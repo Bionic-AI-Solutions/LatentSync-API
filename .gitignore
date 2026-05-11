@@ -34,6 +34,9 @@ Thumbs.db
 *.wav
 *.png
 *.jpg
+# … but keep the lip-mask assets shipped with the LatentSync repo — `load_fixed_mask`
+# reads these at inference time and the container fails fast without them.
+!latentsync/utils/mask*.png
 
 # Secrets / env
 .env
