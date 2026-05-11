@@ -1,0 +1,8 @@
+[Unit]
+Description=Auto-poweroff the brev latentsync box after sustained idle (stops GPU billing)
+After=docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/latentsync-idle-watchdog.sh
