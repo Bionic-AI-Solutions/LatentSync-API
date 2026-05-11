@@ -16,7 +16,9 @@ The poll + download URLs are returned so n8n can poll at its own cadence.
 from __future__ import annotations
 
 import asyncio
+import gc
 import logging
+import math
 import os
 import subprocess
 import sys
@@ -25,6 +27,7 @@ import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
 
+import httpx
 import torch
 from accelerate.utils import set_seed
 from diffusers import AutoencoderKL, DDIMScheduler
@@ -52,6 +55,11 @@ DEFAULT_STEPS = int(os.environ.get("LATENTSYNC_STEPS",         "20"))
 DEFAULT_GUID  = float(os.environ.get("LATENTSYNC_GUIDANCE",    "1.5"))
 JOB_TTL       = int(os.environ.get("JOB_TTL_SECONDS",          "3600"))
 BASE_URL      = os.environ.get("BASE_URL",                      "https://mcp.baisoln.com/gpu-ai")
+
+# Chunk long inputs so per-inference RAM stays bounded. Loading a full multi-
+# minute 512×512 video into a single tensor blows past the 144 GB host RAM and
+# OOM-kills uvicorn. 0 disables chunking (single-shot path).
+CHUNK_SECONDS = int(os.environ.get("LATENTSYNC_CHUNK_SECONDS", "30"))
 
 JOBS_DIR = Path("/tmp/latentsync_jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
@@ -127,33 +135,6 @@ def _load_pipeline() -> tuple[LipsyncPipeline, object]:
 # Inference runner (called from executor so it doesn't block the event loop)
 # ---------------------------------------------------------------------------
 
-def _run_inference(job_id: str, video_path: str, audio_path: str,
-                   steps: int, guidance: float) -> str:
-    global _pipeline, _config
-    assert _pipeline is not None, "pipeline not loaded"
-    config = _config
-
-    out_path = str(JOBS_DIR / job_id / "result.mp4")
-    set_seed(42)
-
-    dtype = torch.float16 if (
-        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
-    ) else torch.float32
-
-    _pipeline(
-        video_path=video_path,
-        audio_path=audio_path,
-        video_out_path=out_path,
-        num_frames=config.data.num_frames,
-        num_inference_steps=steps,
-        guidance_scale=guidance,
-        weight_dtype=dtype,
-        width=config.data.resolution,
-        height=config.data.resolution,
-    )
-    return out_path
-
-
 def _probe_duration(path: str) -> float:
     r = subprocess.run(
         ["ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -161,6 +142,123 @@ def _probe_duration(path: str) -> float:
         capture_output=True, text=True,
     )
     return float(r.stdout.strip()) if r.returncode == 0 else 0.0
+
+
+def _run_pipeline_once(video_path: str, audio_path: str, out_path: str,
+                        steps: int, guidance: float) -> None:
+    """Single pipeline call. Frees GPU/CPU memory after."""
+    dtype = torch.float16 if (
+        torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
+    ) else torch.float32
+    _pipeline(
+        video_path=video_path,
+        audio_path=audio_path,
+        video_out_path=out_path,
+        num_frames=_config.data.num_frames,
+        num_inference_steps=steps,
+        guidance_scale=guidance,
+        weight_dtype=dtype,
+        width=_config.data.resolution,
+        height=_config.data.resolution,
+    )
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _run_inference(job_id: str, video_path: str, audio_path: str,
+                   steps: int, guidance: float) -> str:
+    global _pipeline, _config
+    assert _pipeline is not None, "pipeline not loaded"
+
+    out_path = str(JOBS_DIR / job_id / "result.mp4")
+    set_seed(42)
+
+    duration = _probe_duration(video_path)
+    if CHUNK_SECONDS <= 0 or duration <= CHUNK_SECONDS:
+        logger.info("Job %s: single-shot (duration=%.1fs, chunk=%ds)", job_id, duration, CHUNK_SECONDS)
+        _run_pipeline_once(video_path, audio_path, out_path, steps, guidance)
+        return out_path
+
+    # Chunked path: split → inference each chunk → concat results
+    num_chunks = math.ceil(duration / CHUNK_SECONDS)
+    logger.info("Job %s: chunked path (duration=%.1fs → %d × %ds chunks)",
+                job_id, duration, num_chunks, CHUNK_SECONDS)
+    work_dir = JOBS_DIR / job_id / "chunks"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    chunk_outputs: list[str] = []
+    for i in range(num_chunks):
+        start = i * CHUNK_SECONDS
+        v_chunk = str(work_dir / f"video_{i:04d}.mp4")
+        a_chunk = str(work_dir / f"audio_{i:04d}.wav")
+        o_chunk = str(work_dir / f"out_{i:04d}.mp4")
+
+        # Re-encode video chunk to ensure frame-accurate cuts (libx264, fast preset).
+        subprocess.run([
+            "ffmpeg", "-y", "-ss", str(start), "-t", str(CHUNK_SECONDS),
+            "-i", video_path,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+            "-an", v_chunk,
+        ], capture_output=True, check=True)
+        # Audio chunk: stream copy (audio is already wav/flac, no re-encode needed).
+        subprocess.run([
+            "ffmpeg", "-y", "-ss", str(start), "-t", str(CHUNK_SECONDS),
+            "-i", audio_path, "-c", "copy", a_chunk,
+        ], capture_output=True, check=True)
+
+        logger.info("Job %s: chunk %d/%d (%.1fs–%.1fs) inference start",
+                    job_id, i + 1, num_chunks, start, start + CHUNK_SECONDS)
+        try:
+            _run_pipeline_once(v_chunk, a_chunk, o_chunk, steps, guidance)
+            logger.info("Job %s: chunk %d/%d done (lipsynced)", job_id, i + 1, num_chunks)
+        except RuntimeError as exc:
+            # Face-detection failure on a chunk shouldn't kill the whole job. Most
+            # real-world videos have intro/cutaway segments with no face — pass
+            # those through unchanged (original video + dubbed audio muxed) so
+            # the final timeline is preserved and lipsync applies wherever a
+            # face *was* present.
+            msg = str(exc).lower()
+            if "face not detected" in msg or "no face" in msg:
+                logger.warning("Job %s: chunk %d/%d face-detect failed (%s) — passthrough",
+                               job_id, i + 1, num_chunks, exc)
+                subprocess.run([
+                    "ffmpeg", "-y",
+                    "-i", v_chunk, "-i", a_chunk,
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                    "-c:a", "aac", "-shortest",
+                    o_chunk,
+                ], capture_output=True, check=True)
+            else:
+                raise
+
+        chunk_outputs.append(o_chunk)
+        # Free intermediates as we go.
+        Path(v_chunk).unlink(missing_ok=True)
+        Path(a_chunk).unlink(missing_ok=True)
+
+    # Concat output chunks. Lipsync output and passthrough output may differ in
+    # codec params, so re-encode at concat time. One pass over the final video
+    # — cheap relative to inference.
+    list_file = work_dir / "concat_list.txt"
+    list_file.write_text("\n".join(f"file '{p}'" for p in chunk_outputs))
+    subprocess.run([
+        "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+        "-c:a", "aac",
+        out_path,
+    ], capture_output=True, check=True)
+
+    # Cleanup chunk outputs (keep only the concatenated final).
+    for p in chunk_outputs:
+        Path(p).unlink(missing_ok=True)
+    list_file.unlink(missing_ok=True)
+    try:
+        work_dir.rmdir()
+    except OSError:
+        pass
+
+    return out_path
 
 
 # ---------------------------------------------------------------------------
@@ -202,6 +300,17 @@ async def _job_worker():
                 "finished_at": time.time(),
             })
         finally:
+            # Fire callback (success or failure) so clients can skip polling.
+            cb_url = payload.get("callback_url")
+            if cb_url:
+                try:
+                    async with httpx.AsyncClient(timeout=30.0) as client:
+                        resp = await client.post(cb_url, json=_jobs[job_id])
+                    logger.info("Job %s callback -> %s (status %d)",
+                                job_id, cb_url, resp.status_code)
+                except Exception as cb_exc:
+                    logger.warning("Job %s callback -> %s failed: %s",
+                                   job_id, cb_url, cb_exc)
             _job_queue.task_done()
             asyncio.create_task(_cleanup_after(job_id, JOB_TTL))
 
@@ -270,6 +379,9 @@ async def submit_lipsync(
     inference_steps: int = Query(DEFAULT_STEPS, ge=10, le=50),
     guidance_scale: float = Query(DEFAULT_GUID, ge=1.0, le=3.0),
     model: str = Query("latentsync-1.5"),  # accepted for API compat, ignored
+    callback_url: str | None = Query(None,
+        description="If set, POST job state (JSON) to this URL on completion or failure. "
+                    "Lets clients (e.g. n8n Wait-on-webhook) avoid polling."),
 ):
     if not _ready:
         raise HTTPException(503, "Pipeline not ready")
@@ -298,6 +410,7 @@ async def submit_lipsync(
         "audio_path": audio_path,
         "steps": inference_steps,
         "guidance": guidance_scale,
+        "callback_url": callback_url,
     }))
 
     poll_url = f"{BASE_URL}/v1/video/lipsync/jobs/{job_id}"
