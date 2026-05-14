@@ -21,10 +21,16 @@ services:
       context: ..
       dockerfile: server/Dockerfile
     image: docker4zerocool/ai-latentsync:latest
-    container_name: ai-latentsync
+    # Renamed from ai-latentsync 2026-05-14: collided with production-style
+    # naming on the home gpu node and got auto-spun-up whenever the
+    # LatentSync-API workspace opened in a Dev Container, squatting ~19 GiB
+    # on GPU 1 next to vLLM. Production deployment lives on Brev L40S
+    # (project_latentsync_api memory). Host port 8114 (was 8014) keeps dev
+    # traffic from accidentally hitting the canonical 80xx ai-services range.
+    container_name: latentsync-devcontainer
     restart: unless-stopped
     ports:
-      - "8014:8014"
+      - "8114:8014"
     environment:
       LATENTSYNC_CKPT_PATH:    /models/latentsync_unet.pt
       LATENTSYNC_WHISPER_PATH: /models/whisper/tiny.pt
