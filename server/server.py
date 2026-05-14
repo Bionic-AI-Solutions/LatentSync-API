@@ -61,6 +61,12 @@ BASE_URL      = os.environ.get("BASE_URL",                      "https://mcp.bai
 # OOM-kills uvicorn. 0 disables chunking (single-shot path).
 CHUNK_SECONDS = int(os.environ.get("LATENTSYNC_CHUNK_SECONDS", "30"))
 
+# In-container idle sleep: after IDLE_TIMEOUT seconds of no jobs, move the
+# UNet/VAE weights to CPU RAM and release ~19 GiB of GPU VRAM. Wakes
+# automatically (~2-3s) on the next inference job.
+IDLE_TIMEOUT       = int(os.environ.get("LATENTSYNC_IDLE_TIMEOUT_SECONDS", "300"))
+IDLE_CHECK_INTERVAL = int(os.environ.get("LATENTSYNC_IDLE_CHECK_SECS",       "30"))
+
 JOBS_DIR = Path("/tmp/latentsync_jobs")
 JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -79,6 +85,11 @@ _config = None
 _ready = False
 _job_queue: asyncio.Queue = asyncio.Queue()
 _jobs: dict[str, dict] = {}
+
+# Sleep-mode state. Updated whenever a job is enqueued or starts processing.
+_last_activity: float = 0.0
+_is_sleeping: bool = False
+_wake_lock: asyncio.Lock | None = None  # initialized in lifespan()
 
 
 # ---------------------------------------------------------------------------
@@ -266,11 +277,16 @@ def _run_inference(job_id: str, video_path: str, audio_path: str,
 # ---------------------------------------------------------------------------
 
 async def _job_worker():
+    global _last_activity
     loop = asyncio.get_event_loop()
     while True:
         job_id, payload = await _job_queue.get()
+        # Wake the pipeline before we mark the job as processing — wake time
+        # (~2-3s) is part of the job's latency, not its idle window.
+        await _ensure_awake()
+        _last_activity = time.time()
         _jobs[job_id]["status"] = "processing"
-        _jobs[job_id]["started_at"] = time.time()
+        _jobs[job_id]["started_at"] = _last_activity
         logger.info("Processing job %s (queue remaining: %d)", job_id, _job_queue.qsize())
         try:
             out_path = await loop.run_in_executor(
@@ -300,6 +316,10 @@ async def _job_worker():
                 "finished_at": time.time(),
             })
         finally:
+            # Reset the idle clock at job completion too — otherwise a long
+            # multi-minute chunked job would count its own runtime against
+            # the idle timeout and immediately offload right after returning.
+            _last_activity = time.time()
             # Fire callback (success or failure) so clients can skip polling.
             cb_url = payload.get("callback_url")
             if cb_url:
@@ -313,6 +333,78 @@ async def _job_worker():
                                    job_id, cb_url, cb_exc)
             _job_queue.task_done()
             asyncio.create_task(_cleanup_after(job_id, JOB_TTL))
+
+
+# ---------------------------------------------------------------------------
+# In-container sleep mode — offload pipeline weights to CPU when idle.
+# ---------------------------------------------------------------------------
+
+def _offload_to_cpu() -> None:
+    """Move pipeline (vae+unet via diffusers .to()) + audio_encoder.model
+    (plain class, moved explicitly) to CPU, then free CUDA cache."""
+    global _is_sleeping
+    if _is_sleeping or _pipeline is None or not torch.cuda.is_available():
+        return
+    t0 = time.time()
+    _pipeline.to("cpu")
+    # Audio2Feature is not an nn.Module so it's not moved by pipeline.to();
+    # it holds the actual Whisper model on .model and we have to move that
+    # by hand, otherwise the ~70 MB encoder stays pinned on GPU.
+    enc = getattr(_pipeline, "audio_encoder", None)
+    if enc is not None and hasattr(enc, "model") and hasattr(enc.model, "to"):
+        enc.model.to("cpu")
+    gc.collect()
+    torch.cuda.empty_cache()
+    _is_sleeping = True
+    logger.info("Pipeline offloaded to CPU in %.2fs — GPU VRAM released", time.time() - t0)
+
+
+def _restore_to_cuda() -> None:
+    """Move pipeline back to GPU. Idempotent — safe to call when already awake."""
+    global _is_sleeping
+    if not _is_sleeping or _pipeline is None or not torch.cuda.is_available():
+        return
+    t0 = time.time()
+    _pipeline.to("cuda")
+    enc = getattr(_pipeline, "audio_encoder", None)
+    if enc is not None and hasattr(enc, "model") and hasattr(enc.model, "to"):
+        enc.model.to("cuda")
+    _is_sleeping = False
+    logger.info("Pipeline restored to GPU in %.2fs", time.time() - t0)
+
+
+async def _ensure_awake() -> None:
+    """Wake the pipeline if sleeping. Holds _wake_lock so concurrent jobs
+    serialize on a single wake call rather than racing."""
+    if not _is_sleeping:
+        return
+    async with _wake_lock:
+        if _is_sleeping:
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _restore_to_cuda)
+
+
+async def _idle_monitor():
+    """Background task: offload to CPU after IDLE_TIMEOUT of no job activity."""
+    while True:
+        await asyncio.sleep(IDLE_CHECK_INTERVAL)
+        if _is_sleeping or _last_activity == 0.0:
+            continue
+        # Don't sleep while a job is in-flight (queue non-empty OR a job is
+        # in "processing" status). _last_activity is only updated when a job
+        # actually starts, so a queued-but-not-started job would otherwise be
+        # eligible for offload mid-startup.
+        busy = (
+            _job_queue.qsize() > 0
+            or any(j.get("status") == "processing" for j in _jobs.values())
+        )
+        if busy:
+            continue
+        idle = time.time() - _last_activity
+        if idle >= IDLE_TIMEOUT:
+            logger.info("Idle for %.0fs (threshold %ds) — offloading pipeline", idle, IDLE_TIMEOUT)
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, _offload_to_cpu)
 
 
 async def _cleanup_after(job_id: str, delay: int):
@@ -331,14 +423,20 @@ async def _cleanup_after(job_id: str, delay: int):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pipeline, _config, _ready
+    global _pipeline, _config, _ready, _last_activity, _wake_lock
     loop = asyncio.get_event_loop()
     logger.info("Starting pipeline load…")
     _pipeline, _config = await loop.run_in_executor(None, _load_pipeline)
     _ready = True
+    _last_activity = time.time()
+    _wake_lock = asyncio.Lock()
     worker = asyncio.create_task(_job_worker())
+    idle_task = asyncio.create_task(_idle_monitor())
+    logger.info("Idle sleep enabled — timeout=%ds, check_interval=%ds",
+                IDLE_TIMEOUT, IDLE_CHECK_INTERVAL)
     yield
     worker.cancel()
+    idle_task.cancel()
 
 
 app = FastAPI(title="LatentSync Lipsync API", version="1.0.0", lifespan=lifespan)
@@ -360,12 +458,17 @@ def readyz():
     if not _ready:
         return JSONResponse({"status": "loading"}, status_code=503)
     busy = any(j["status"] == "processing" for j in _jobs.values())
+    idle_seconds = round(time.time() - _last_activity, 1) if _last_activity else None
+    body = {
+        "queue_depth": _job_queue.qsize(),
+        "gpu_sleeping": _is_sleeping,
+        "idle_seconds": idle_seconds,
+        "idle_timeout_seconds": IDLE_TIMEOUT,
+    }
     if busy:
-        return JSONResponse(
-            {"status": "busy", "queue_depth": _job_queue.qsize()},
-            status_code=202,
-        )
-    return {"status": "idle", "queue_depth": _job_queue.qsize()}
+        return JSONResponse({**body, "status": "busy"}, status_code=202)
+    body["status"] = "idle"
+    return body
 
 
 # ---------------------------------------------------------------------------
