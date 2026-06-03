@@ -49,10 +49,16 @@ services:
       - /etc/ssl/certs/ca-certificates.crt:/etc/ssl/certs/ca-certificates.crt:ro
 
     runtime: nvidia
+    # Pin to a single GPU by UUID instead of "count: all". With count:all the
+    # container grabbed every GPU and LatentSync defaulted to cuda:0, colliding
+    # with whatever else lived there and OOMing. GPU 0 = RTX 5090 (32 GB), GPU 1
+    # = RTX PRO 6000 (96 GB) but the latter is ~fully held by the vLLM
+    # qwen3.6-35b server, so the 5090 (GPU 0) has the most free VRAM. Pin there.
+    # To repin, swap the UUID (nvidia-smi -L) or use NVIDIA_VISIBLE_DEVICES.
     deploy:
       resources:
         reservations:
           devices:
             - driver: nvidia
-              count: all
+              device_ids: ["GPU-520e01f2-cf30-6396-abef-e8e9a5233b0e"]  # RTX 5090 (GPU 0)
               capabilities: [gpu]
