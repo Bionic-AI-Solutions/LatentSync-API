@@ -41,6 +41,7 @@ sys.path.insert(0, str(_REPO_ROOT))
 
 from latentsync.models.unet import UNet3DConditionModel
 from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+from latentsync.utils.face_detector import FaceDetector
 from latentsync.whisper.audio2feature import Audio2Feature
 from DeepCache import DeepCacheSDHelper
 
@@ -90,6 +91,18 @@ _jobs: dict[str, dict] = {}
 _last_activity: float = 0.0
 _is_sleeping: bool = False
 _wake_lock: asyncio.Lock | None = None  # initialized in lifespan()
+
+# Standalone InsightFace detector for the /v1/video/face/detect endpoint.
+# The lipsync pipeline builds its own ImageProcessor (and thus its own
+# FaceDetector / InsightFace FaceAnalysis) per call inside LipsyncPipeline
+# .__call__, so there is no persistent detector instance to borrow at rest.
+# Rather than spin up InsightFace per face-detect request, we lazily build a
+# single FaceDetector here on first use and reuse it. It uses the SAME
+# FaceDetector class (same model files at /root/.insightface, same
+# allowed_modules=["detection", "landmark_2d_106"]) the lipsync path uses, so
+# no new weights are downloaded. The lipsync path is left completely untouched.
+_face_detector: FaceDetector | None = None
+_face_detector_lock: asyncio.Lock | None = None  # initialized in lifespan()
 
 
 # ---------------------------------------------------------------------------
@@ -423,13 +436,14 @@ async def _cleanup_after(job_id: str, delay: int):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pipeline, _config, _ready, _last_activity, _wake_lock
+    global _pipeline, _config, _ready, _last_activity, _wake_lock, _face_detector_lock
     loop = asyncio.get_event_loop()
     logger.info("Starting pipeline load…")
     _pipeline, _config = await loop.run_in_executor(None, _load_pipeline)
     _ready = True
     _last_activity = time.time()
     _wake_lock = asyncio.Lock()
+    _face_detector_lock = asyncio.Lock()
     worker = asyncio.create_task(_job_worker())
     idle_task = asyncio.create_task(_idle_monitor())
     logger.info("Idle sleep enabled — timeout=%ds, check_interval=%ds",
@@ -549,3 +563,89 @@ def get_job_result(job_id: str):
         media_type="video/mp4",
         filename=f"lipsync_{job_id[:8]}.mp4",
     )
+
+
+# ---------------------------------------------------------------------------
+# Face detection endpoint — detection-only, reuses the lipsync InsightFace.
+# ---------------------------------------------------------------------------
+
+def _build_face_detector() -> FaceDetector:
+    """Construct the standalone InsightFace detector (blocking; run in an
+    executor). Uses the same FaceDetector the lipsync ImageProcessor uses, so
+    weights are loaded from the existing /root/.insightface cache — no new
+    downloads. Detection-only: this does NOT touch the UNet/VAE diffusion
+    pipeline or its GPU residency, so it never wakes or holds the lipsync GPU
+    allocation beyond a cheap InsightFace forward pass."""
+    logger.info("Building standalone InsightFace face detector (first use)…")
+    det = FaceDetector(device="cuda")
+    logger.info("Face detector ready")
+    return det
+
+
+async def _ensure_face_detector() -> FaceDetector:
+    """Lazily build the face detector once and reuse it across requests."""
+    global _face_detector
+    if _face_detector is not None:
+        return _face_detector
+    async with _face_detector_lock:
+        if _face_detector is None:
+            loop = asyncio.get_event_loop()
+            _face_detector = await loop.run_in_executor(None, _build_face_detector)
+    return _face_detector
+
+
+def _detect_faces(detector: FaceDetector, img) -> list[dict]:
+    """Run InsightFace on a decoded BGR image and map each detection to the
+    response schema. Sorted by score descending. Pure detect — no diffusion."""
+    faces = detector.app.get(img)
+    if not faces:
+        return []
+    out: list[dict] = []
+    for face in faces:
+        bbox = [float(v) for v in face.bbox.tolist()]
+        # face.pose is [pitch, yaw, roll] only when a pose-capable landmark
+        # model ran (landmark_3d_68). The lipsync detector uses
+        # landmark_2d_106, which does not populate pose, so yaw is typically
+        # null here — which the contract allows (yaw: float|null).
+        yaw = None
+        pose = getattr(face, "pose", None)
+        if pose is not None and len(pose) >= 2:
+            yaw = float(pose[1])
+        out.append({
+            "score": float(face.det_score),
+            "bbox": bbox,
+            "yaw": yaw,
+        })
+    out.sort(key=lambda f: f["score"], reverse=True)
+    return out
+
+
+@app.post("/v1/video/face/detect")
+async def detect_face(image: UploadFile = File(...)):
+    """Detect faces in a single image using the bundled InsightFace detector.
+
+    Detection-only — does not run the lipsync UNet/diffusion pipeline and does
+    not wake or hold the GPU beyond a cheap InsightFace forward pass.
+
+    Returns: {"has_face": bool, "faces": [{"score", "bbox":[x1,y1,x2,y2],
+    "yaw": float|null}]} with faces sorted by score descending.
+    """
+    if not _ready:
+        raise HTTPException(503, "Service not ready")
+
+    import cv2
+    import numpy as np
+
+    raw = await image.read()
+    if not raw:
+        raise HTTPException(400, "Empty image upload")
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if img is None:
+        raise HTTPException(400, "Could not decode image")
+
+    detector = await _ensure_face_detector()
+    loop = asyncio.get_event_loop()
+    faces = await loop.run_in_executor(None, _detect_faces, detector, img)
+
+    return {"has_face": len(faces) > 0, "faces": faces}
